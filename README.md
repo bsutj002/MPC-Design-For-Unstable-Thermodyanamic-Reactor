@@ -1,153 +1,108 @@
-# Data-Augmented Control Synthesis and CLF-CBF Verification for CSTR
+# MPC Framework: Thermodynamic Chemical Reactor
 
-A Python-based framework for extracting nominal linear models, evaluating Control Lyapunov Functions (CLF), and synthesizing Control Barrier Functions (CBF) for an open-loop unstable Continuous Stirred-Tank Reactor (CSTR).
-
----
-
-## Technical Overview
-
-The framework provides an end-to-end control and system identification pipeline:
-
-* **Dynamic Simulation:** Simulates the non-linear coupled mass and energy dynamics of a CSTR.
-* **Ground Truth Matrix Extraction:** Stacks state X and control U snapshots into an augmented matrix representation to extract local linear state-space ground truth matrices of the linear state-space model Ax + Bu using by augmenting the state and control matrices, appending them with the matrix representing the vector field of the system manifold xdot, and solving for the Moore-Penrose pseudoinverse.
-* **Control Lyapunov Function (CLF) Synthesis:** Models energy decay and tracks performance stability using the Continuous-Time Algebraic Lyapunov Equation (CALE).
-* **Control Barrier Function (CBF) & Lie Derivative Auditing:** Constructs equilibrium-centered safety cages using Nagumo's theorem and evaluates scalar drift ($L_f h$), actuator leverage ($L_g h$), boundary variance projections, and gradient stability.
-* **Pure CLF-CBF QP Controller Integration (Active Work):** Synthesizes a unified Quadratic Program (QP) to act as the primary real-time controller without relying on a nominal baseline control law.
+A comprehensive structural outline and mathematical blueprint for a Model Predictive Control (MPC) framework tailored for an open-loop unstable, thermodynamically-driven, single-unit chemical reactor with high observability, state/output constraints, bounded uniform noise, and a controlled Relative Gain Array (RGA) strategy.
 
 ---
 
-## Governing System Equations & Control Formulations
+## 1. System Mathematical Model (State-Space Form)
 
-### Non-Linear CSTR Dynamics
-The internal state of the CSTR is defined by the state vector $\mathbf{x}(t) = [C_A(t), T(t)]^T$:
-* $C_A(t)$: Concentration of reactant $A$ ($\text{kmol/m}^3$)
-* $T(t)$: Reactor temperature ($\text{K}$)
+Since the system is open-loop unstable and driven by thermodynamics (pure energy/mass balances without complex kinetic/transport PDEs), we represent it as a continuous-time (or discretized) linear or mildly nonlinear state-space system.
 
-The coupled differential equations governing mass and energy balances are:
+Let the state vector be $x \in \mathbb{X} \subset \mathbb{R}^n$, the control input be $u \in \mathbb{U} \subset \mathbb{R}^m$, and the process noise be $w \in \mathbb{W} \subset \mathbb{R}^n$ (bounded uniform noise, e.g., $\Vert w(t)\Vert_\infty \le \epsilon_w$).
 
-$$\frac{dC_A}{dt} = \frac{q}{V} (C_{Af} - C_A) - k_0 \exp\left(-\frac{E}{R T}\right) C_A$$
+### State-Space Equations
 
-$$\frac{dT}{dt} = \frac{q}{V} (T_f - T) + \Delta H_{\text{term}} \cdot k_0 \exp\left(-\frac{E}{R T}\right) C_A - U_A (T - T_c)$$
+**Linearized / Nominal Form:**
+$$\dot{x}(t) = A x(t) + B u(t) + w(t)$$
+$$y(t) = C x(t)$$
 
-Where $T_c$ acts as the control input $u(t)$ modulating system dynamics through the cooling jacket.
+**Mildly Nonlinear Form (if explicitly capturing thermodynamic state couplings):**
+$$\dot{x}(t) = f(x(t)) + g(x(t))u(t) + w(t)$$
+$$y(t) = h(x(t))$$
 
-### Data-Augmented Ground Truth Matrix Extraction
-To extract the nominal linear ground truth matrices without relying on open-loop dither/excitation, state vector snapshots $\mathbf{X}$ and control inputs $\mathbf{U}$ are stacked into an augmented workspace matrix $\mathbf{X}_U$:
-
-$$\mathbf{X}_U = \begin{bmatrix} \mathbf{X} \\ \mathbf{U} \end{bmatrix}$$
-
-Using the exact time derivative matrix $\dot{\mathbf{X}}$, the ground-truth system matrices $\mathbf{A}_{\text{nominal}}$ and $\mathbf{B}_{\text{nominal}}$ are solved simultaneously via the Moore-Penrose pseudoinverse:
-
-$$\begin{bmatrix} \mathbf{A}_{\text{nominal}} & \mathbf{B}_{\text{nominal}} \end{bmatrix} = \dot{\mathbf{X}} \, \mathbf{X}_U^\dagger$$
-
----
-
-## CLF & Safety Barrier Synthesis
-
-### Continuous Algebraic Lyapunov Equation (CALE)
-Given closed-loop performance intent $\mathbf{A}_{\text{cl}} = \mathbf{A} - \mathbf{B}\mathbf{K}$ and state penalty matrix $\mathbf{Q}$, the positive-definite shape matrix $\mathbf{P}$ is computed numerically using `scipy.linalg.solve_continuous_lyapunov`:
-
-$$\mathbf{A}_{\text{cl}}^T \mathbf{P} + \mathbf{P} \mathbf{A}_{\text{cl}} = -\mathbf{Q}$$
-
-The performance potential $V(\mathbf{x})$ and temporal decay rate $\dot{V}(\mathbf{x})$ are evaluated as:
-
-$$V(\mathbf{x}) = \mathbf{x}^T \mathbf{P} \mathbf{x}$$
-
-$$\dot{V}(\mathbf{x}) = 2 \mathbf{x}^T \mathbf{P} (\mathbf{A}\mathbf{x} + \mathbf{B} u)$$
-
-### Control Lyapunov Function (CLF) Negative Definiteness
-To ensure asymptotic stability, the temporal derivative of the Control Lyapunov Function must remain strictly negative along the system trajectories:
-
-$$\dot{V}(\mathbf{x}) = 2 \mathbf{x}^T \mathbf{P} (\mathbf{A}\mathbf{x} + \mathbf{B} u) < 0 \quad \forall \, \mathbf{x} \neq \mathbf{0}$$
-
-If $\dot{V}(\mathbf{x}) \ge 0$, the controller fails to dissipate system energy rapidly enough, allowing the unmodeled non-linear kinetics and open-loop thermal runaway modes to override closed-loop dynamics and destabilize the reactor.
-
-### Equilibrium-Ellipsoid Safety Set (CBF) & Nagumo's Theorem
-Following Nagumo's theorem, invariance of the safe set $\mathcal{C}$ is guaranteed if the tangent vector field points inward or along the boundary at all points where the barrier function equals zero. For a Control Barrier Function $h(\mathbf{x})$ defining the safe set $\mathcal{C} = \{ \mathbf{x} \in \mathbb{R}^n : h(\mathbf{x}) \ge 0 \}$, Nagumo's theorem requires that there exists an extended class-$\mathcal{K}$ function $\alpha$ for all states of x in the safe set such that:
-
-$$\dot{h}(\mathbf{x}) \ge -\alpha(h(\mathbf{x}))$$
-
-Applying this to the equilibrium-centered safety cage built around the origin ($\mathbf{x}_e = \mathbf{0}$):
-
-$$\mathcal{C} = \{ \mathbf{x} \in \mathbb{R}^n : \mathbf{x}^T \mathbf{P} \mathbf{x} \le \delta^2 \}$$
-
-$$h(\mathbf{x}) = \delta^2 - \mathbf{x}^T \mathbf{P} \mathbf{x} \ge 0$$
-
-### Lie Derivative Decomposition
-$$\nabla h(\mathbf{x}) = \frac{\partial h}{\partial \mathbf{x}} = -2 \mathbf{x}^T \mathbf{P}$$
-
-$$L_f h = \nabla h(\mathbf{x}) f(\mathbf{x}) = -2 \mathbf{x}^T \mathbf{P} (\mathbf{A}\mathbf{x})$$
-
-$$L_g h = \nabla h(\mathbf{x}) g(\mathbf{x}) = -2 \mathbf{x}^T \mathbf{P} \mathbf{B}$$
+### Key Properties
+* **Open-Loop Instability:** At least one eigenvalue of $A$ (or the Jacobian $\frac{\partial f}{\partial x}$) has a positive real part ($\mathrm{Re}(\lambda_i) > 0$).
+* **Observability:** The observability matrix $$
+\mathcal{O} = \begin{bmatrix} C^\top & (CA)^\top & \dots & (CA^{n-1})^\top \end{bmatrix}^\top
+$$ has full rank $n$ (high inherent observability, ensuring the assumed state estimator provides an accurate full-state vector $\hat{x} \approx x$).
+* **No Non-Minimum Phase Zeroes:** Transmission zeroes (or multivariable equivalents) lie strictly in the left half-plane, meaning no inverse-response behaviors that fight high-bandwidth tracking.
 
 ---
 
-## Structural Analysis of Lie Derivatives
+## 2. Relative Gain Array (RGA) Integration & Input Bundling
 
-### 1. Independent Lie Derivative Component Audits ($L_f h$ vs. $L_g h$)
-The codebase explicitly decouples the Lie derivative calculation into $f(x)$ (unforced drift) and $g(x)$ (actuator mapping) components to perform independent physical audits:
-* **Drift Flux Audit ($L_f h$):** Evaluates system observability and natural trajectory propagation. When $L_f h < 0$, unforced thermodynamics naturally pull the state toward safety. When $L_f h > 0$, thermal drift accelerates toward a boundary violation.
-* **Actuator Leverage Audit ($L_g h$):** Measures real-time actuator authority over the safety boundary normal.
+To bundle system states and control inputs while controlling interaction, we use the RGA matrix $\Lambda$:
 
-### 2. Higher-Order Lie Derivatives, Actuator Paralysis, and Chattering
-If $L_g h \approx 0$, the actuator is physically vector-aligned parallel to the boundary wall, leaving it momentarily powerless to alter boundary distance.
+$$\Lambda = G(0) \times \left(G(0)^{-1}\right)^\top$$
 
-In higher-relative-degree architectures where $L_g h = 0$, safety synthesis requires computing higher-order Lie derivatives (e.g., $L_f^2 h$, $L_g L_f h$). However, higher-order derivatives drastically amplify noise present in incoming sensor streams. This sensor noise propagation destabilizes the QP decision boundary, causing rapid high-frequency control input switching—known as actuator chattering—which accelerates physical mechanical wear on valves and pumps.
+where $G(0)$ is the steady-state gain matrix.
 
-### 3. SVD-Based Condition Number Monitoring ($\kappa$)
-Actuator authority is audited by performing a Singular Value Decomposition (SVD) on $L_g h$ to extract maximum ($\sigma_{\max}$) and minimum ($\sigma_{\min}$) singular values:
+### Initial Design ($\Lambda_{ij} \in [0.5, 0.7]$)
+An RGA value in this range indicates moderate interaction between loops. This is deliberate: it prevents excessive loop-fighting while keeping the pairing meaningful enough to test decoupling structures.
 
-$$\text{SVD}(L_g h) = U \Sigma V^T \implies \kappa = \frac{\sigma_{\max}}{\sigma_{\min} + \epsilon}$$
-
-If $\kappa > 100$, the system approaches ill-conditioned control mapping. Rather than applying hard guardrails—which can alter control dynamics unpredictably and create severe operational hazards—the architecture generates real-time warnings to soften optimization constraints downstream.
-
-### 4. Boundary Gradient Stress Testing via $\epsilon$-Nudge Perturbation
-To verify the structural stability of the gradient matrix $\nabla h(\mathbf{x}) = \frac{\partial h}{\partial \mathbf{x}}$ independently before coupling it with system vector fields $f(\mathbf{x})$ and $g(\mathbf{x})$, the code executes an $\epsilon$-nudge perturbation test:
-1. A small virtual displacement vector ($\epsilon \approx 10^{-5}$) is applied along the gradient normal: $\mathbf{x}_{\text{perturbed}} = \mathbf{x} + \epsilon \cdot \frac{\nabla h^T}{\Vert{}\nabla h\Vert{}}$.
-2. The non-linear barrier function at a perturbed state $\mathbf{x}_{\text{pert}}$ is compared against its first-order linear Taylor series expansion around $\mathbf{x}$:
-
-$$h(\mathbf{x}_{\text{pert}}) \approx h(\mathbf{x}) + \nabla h(\mathbf{x})^T (\mathbf{x}_{\text{pert}} - \mathbf{x})$$
-
-Residual errors above $10^{-8}$ trigger non-linearity warnings, verifying local geometric smoothness before online optimization.
-
-### 5. Covariance Mapping vs. Collinearity for Observability Auditing
-To assess internal state observability vulnerabilities and drift sensitivity, this framework utilizes Boundary Variance Projection (Covariance Mapping) over collinearity audits:
-* **Limitations of Collinearity:** Collinearity metrics zoom in locally on isolated data points or specific vector alignments, failing to capture holistic systemic behavior.
-* **Advantages of Covariance Mapping:** Projecting state uncertainty covariance $\mathbf{\Sigma}_x$ directly onto the safety boundary normal ($\sigma_h^2 = \nabla h \cdot \mathbf{\Sigma}_x \cdot \nabla h^T$) delivers a comprehensive, system-wide view of state estimation risk and observability degradation across the entire operating region.
+### State/Input Bundling
+We structure the input weighting matrix $R$ in the MPC cost function based on the RGA pairing inverse metrics, penalizing cross-coupling channels appropriately so that the optimizer favors decentralized authority along well-conditioned directions.
 
 ---
 
-## Architectural Assumptions: Pure CLF-CBF (No Nominal Controller) in CSTR Applications
+## 3. Problem Workflow & Theoretical Guarantees
 
-In a low-dimensional Continuous Stirred-Tank Reactor (CSTR) with simple kinetics, a pure CLF-CBF controller is highly feasible without requiring a nominal baseline controller. Unlike robotics (which suffers from non-convex physical obstacles and multi-stage path planning), this simplified case CSTR benefits from:
+Because the plant is open-loop unstable, standard MPC formulations can easily drive the system unbounded during constraint activation or estimation errors unless stability and robustness proofs are explicitly embedded.
 
-* **Trivial Safety Geometry:** Safety boundaries are static, decoupled box limits ($T_{\min}, T_{\max}, C_{A,\min}, C_{A,\max}$).
-* **Thermodynamic Alignment:** Kinetic coupling means driving the system toward steady state (CLF) naturally aligns with keeping temperature bounded (CBF).
-* **Ultra-Low Solver Overhead:** A 2-state, 1-input system leads to a minimal QP that can be solved analytically or via microsecond-level explicit calculations.
-* **Thin Boundary Layers:** High control authority allows the system to operate close to operational limits without triggering conservative, system-stalling actions.
-* **Simplified Reaction Kinetics:** A critical assumption in this formulation is the simplification of reaction kinetics (e.g., first-order, single-reactant Arrhenius steps). In chemical processes, unmodeled complex or multi-stage reaction kinetics represent a substantially greater source of non-linearity than even boundary layer effects or spatial geometry, making kinetic simplification a prerequisite for clean CLF-CBF synthesis.
+### A. Input-to-State Stability (ISS) & Lipschitz Continuity
+* **Lipschitz Continuity:** To guarantee that the controller and plant dynamics do not exhibit finite-time blow-ups or erratic jumps under bounded noise, the vector fields $f(x)$ and $g(x)$ (or matrices $A, B$) are globally Lipschitz continuous on compact sets $\mathbb{X}$ and $\mathbb{U}$:
+  $$\Vert f(x_1) - f(x_2)\Vert \le L_f \Vert x_1 - x_2\Vert$$
+* **ISS Bounds:** Given bounded uniform noise $w$, we establish Input-to-State Stability for the closed-loop system under the MPC feedback law $u = \kappa_{MPC}(x)$. The state trajectory satisfies:
+  $$\Vert x(t)\Vert \le \beta(\Vert x(0)\Vert, t) + \gamma(\Vert w\Vert_\infty)$$
+  where $\beta$ is a class $\mathcal{KL}$ function and $\gamma$ is a class $\mathcal{K}$ function scaling linearly/nonlinearly with the noise bound $\epsilon_w$.
+
+### B. Control Lyapunov Functions (CLFs) for Stability
+To ensure recursive feasibility and closed-loop stability for the unstable reactor, we augment the MPC terminal cost or terminal region using a local Control Lyapunov Function $V(x)$:
+* **CLF Condition:** There exists a control law $u = k(x)$ such that:
+  $$\frac{\partial V}{\partial x} (f(x) + g(x)k(x)) \le -\alpha V(x), \quad \alpha > 0$$
+  In the optimization framework, this is integrated either as a terminal equality constraint ($x(N|t) = 0$), a terminal region constraint ($x(N|t) \in \Omega_f$ where $V(x) \le c$), or as a CLF-based descent constraint enforced at each horizon step to counteract open-loop instability.
+
+### C. Control Barrier Functions (CBFs) for Safety & Constraints
+Since the reactor features strict state and output constraints ($\mathbb{X}, \mathbb{Y}$), we utilize Control Barrier Functions to guarantee forward invariance of the safe set.
+
+Let the safe operating envelope (e.g., maximum reactor temperature, pressure limits) be defined by the superlevel set of a continuously differentiable function $h(x) \ge 0$.
+
+* **CBF Condition (Exponential/Reciprocal):**
+  $$\dot{h}(x, u) + \alpha(h(x)) \ge 0 \quad \forall x \in \mathbb{X}$$
+  The MPC optimization problem incorporates this as a real-time affine constraint on the control action vector $u$, ensuring that even in the presence of bounded uniform noise $w$, the states remain strictly inside physical safety boundaries.
 
 ---
 
-## Current Work: Unified Standalone CLF-CBF QP Controller
+## 4. The Quadratic Programming (QP) / Convex Optimization Problem
 
-**Active Implementation Status:** The current phase of development is focused on formulating and validating the online Quadratic Program (QP) solver that directly unifies the Control Lyapunov Function (CLF) and Control Barrier Function (CBF) constraints.
+With the components above, the finite-horizon optimal control problem (FHOCP) solved at each sampling instant $t$ takes the form of a standard Convex Quadratic Program (QP):
 
-Because this architecture operates without a nominal baseline controller, the QP formulation itself serves as the sole control generator. The optimization problem minimizes control effort while enforcing strict stability and safety guarantees in real time:
+$$\min_{U_t} \sum_{k=0}^{N-1} \left( \Vert x_{t+k|t} - x_r\Vert_{Q}^2 + \Vert u_{t+k|t}\Vert_{R}^2 \right) + \Vert x_{t+N|t}\Vert_{P}^2$$
 
-$$\min_{u, \delta_{\text{slack}}} \, \frac{1}{2} u^T R u + p \cdot \delta_{\text{slack}}^2$$
-
-$$\text{s.t. } \quad L_f V(\mathbf{x}) + L_g V(\mathbf{x})u + c_1 V(\mathbf{x}) \le \delta_{\text{slack}} \quad \text{(CLF Stability Constraint)}$$
-
-$$L_f h(\mathbf{x}) + L_g h(\mathbf{x})u + \alpha(h(\mathbf{x})) \ge 0 \quad \text{(CBF Hard Safety Constraint)}$$
-
-$$u_{\min} \le u \le u_{\max} \quad \text{(Actuator Saturation Limits)}$$
+### Subject to:
+* **System Dynamics:**
+  $$x_{t+k+1|t} = A x_{t+k|t} + B u_{t+k|t}$$
+* **Input Constraints:**
+  $$u_{min} \le u_{t+k|t} \le u_{max}$$
+* **State & Output Constraints:**
+  $$C x_{t+k|t} \in \mathbb{Y}, \quad x_{t+k|t} \in \mathbb{X}$$
+* **CLF Terminal Stability Constraint:**
+  $$V(x_{t+N|t}) \le \rho$$
+* **CBF Safety Constraints:**
+  $$A_{cbf} u_{t+k|t} \le b_{cbf}$$
 
 ---
 
-## Future Work
+## 5. Future Expansion Roadmap: Accommodating Increased RGA Values
 
-* **Lipschitz Continuity Bounds.** Given the maximum residual error between true non-linear CSTR equations and $Ax + Bu$ model over a bounded region, a formal Region of Attraction (RoA) can be computed. Lyapunov theory $V(x)$ is then used to define an invariant sublevel set where the controller guarantees the states will never cross into the "danger zone" where the linear approximation fails.
-* **Input-to-State Stability (ISS) Lyapunov functions:** For an unstable linear system, an open-loop pole with $\text{Re}(\lambda) > 0$ means errors amplify. An ISS proof mathematically guarantees that stabilizing feedback gain $K$ (where $u = Kx$) provides enough damping to overcome the positive eigenvalues, ensuring that bounded data/sensor errors result in bounded, predictable state tracking errors rather than infinite divergence.
+To scale up the project later by increasing the RGA value (moving toward $\Lambda_{ij} \gg 1$, representing strong multivariable coupling and ill-conditioned plant dynamics):
 
-* Doing these proofs will provide the theoretical guarantees, bounds, or structural insights needed to determine how warm starting should be applied (e.g., how aggressive the initialization should be, whether it guarantees speedups without hurting convergence, or if it requires specific safeguards).
+1. **Transition from Diagonal to Full Weighting Matrices:**
+   * *Initial ($\Lambda \approx 0.5-0.7$):* $R$ and $Q$ matrices can be largely diagonal, treating cross-coupling as mild disturbances.
+   * *Increased RGA:* Shift $R$ and $Q$ to full, non-diagonal matrices optimized via Linear Matrix Inequalities (LMIs) or $\mathcal{H}_\infty$/$\mu$-synthesis tools to explicitly penalize directional sensitivity and input amplification.
+
+2. **Incorporate Decentralized / Distributed MPC Structures:**
+   * As RGA increases, centralized MPC can suffer from numerical sensitivity. You can split the single-unit reactor loops into sub-units using a Distributed Cooperative MPC architecture with consensus constraints on shared states.
+
+3. **Robust Tube-MPC Augmentation:**
+   * Higher RGA amplifies noise propagation through cross-coupling channels. Introduce a Tube MPC framework (nominal path planner + robust feedback tracking controller) to tightly bound the effects of the uniform bounded noise $w$ as interaction gains grow.
